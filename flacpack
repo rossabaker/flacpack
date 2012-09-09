@@ -1,0 +1,270 @@
+#!/usr/bin/env python
+
+from mutagen import flac
+from mutagen import id3
+from mutagen import mp3
+
+from multiprocessing import Pool
+
+import os
+import shutil
+import string
+import subprocess
+import traceback
+
+archive = '/home/ross/Music/archive'
+target = '/home/ross/Music/portable'
+
+def walk_archive(archive, pool):
+    for root, dirs, files in os.walk(archive):
+        pool.apply_async(process_dir, [archive, root, dirs, files])
+
+def process_dir(archive, root, dirs, files):
+    try:
+        relroot = os.path.relpath(root, archive)
+        relpaths = map(lambda x: os.path.join(relroot, x), files)
+        replaygain(relpaths)
+        for relpath in relpaths:
+            suffix = os.path.splitext(relpath)[1]
+            if suffix == '.mp3':
+                process_mp3(relpath)
+            if suffix == '.flac':
+                process_flac(relpath)
+    except Exception as e:
+        traceback.print_exc()
+
+def replaygain(relpaths):
+    flacs = filter(lambda x: x.endswith('.flac'), relpaths)
+    if not is_replaygained(flacs):
+        print "Replaygaining {0}".format(os.path.dirname(relpaths[0]))
+        subprocess.call(['metaflac', '--add-replay-gain'] + \
+                            map(to_src, flacs))
+    mp3s = filter(lambda x: x.endswith('.mp3'), relpaths)
+    if not is_mp3gained(mp3s):
+        print "mp3gaining {0}".format(os.path.dirname(relpaths[0]))
+        subprocess.call(['mp3gain', '-q', '-s', 'i'] + \
+                            map(to_src, mp3s))
+
+def is_replaygained(flacpaths):
+    for relpath in flacpaths:
+        tags = flac.FLAC(to_src(relpath))
+        if not tags.has_key('REPLAYGAIN_REFERENCE_LOUDNESS'):
+            return False
+    return True
+
+def is_mp3gained(mp3paths):
+    for relpath in mp3paths:
+        tags = mp3.MP3(to_src(relpath)).tags
+        if len(filter(lambda x: x.desc == 'mp3gain_minmax', \
+                          tags.getall('TXXX'))) == 0:
+            return False
+    return True
+                    
+def process_mp3(relpath):
+    src = to_src(relpath)
+    dest = to_dest(relpath, 'mp3')
+    if not is_current(dest, src):
+        copy_mp3(relpath, src, dest)
+
+def copy_mp3(relpath, src, dest):
+    ensure_dir(dest)
+    tmp = dest + '.tmp'
+    print "Copying {0}".format(relpath)
+    shutil.copy2(src, tmp)
+    shutil.move(tmp, dest)
+
+def process_flac(relpath):
+    src = to_src(relpath)
+    dest = to_dest(relpath, 'mp3')
+    if not is_current(dest, src):
+        encode_mp3(relpath, src, dest)
+        if os.path.exists(dest):
+            tag_mp3(relpath, src, dest)
+    
+def encode_mp3(relpath, src, dest):
+    ensure_dir(dest)
+    print "Encoding {0}".format(relpath)
+    decode = subprocess.Popen(['flac', '-dcs', src], stdout = subprocess.PIPE)
+    tmp = dest + '.tmp'
+    encode = subprocess.Popen(["lame", "-V4", "-S", "-", tmp], \
+                                  stdin = decode.stdout)
+    encode.communicate()
+    if (encode.returncode == 0):
+        shutil.move(tmp, dest)
+
+def tag_mp3(relpath, src, dest):
+    print "Tagging {0}".format(relpath)
+    src_tags = flac.FLAC(src)
+    dest_mp3 = mp3.MP3(dest)
+    if not dest_mp3.tags:
+        dest_mp3.add_tags()
+    dest_tags = dest_mp3.tags
+    dest_tags.clear()
+    for flac_key in src_tags.keys():
+        id3_action = ID3_TAG_MAPPING.get(flac_key)
+        if id3_action:
+            id3_action(dest_tags, src_tags, flac_key)
+    dest_tags.add(id3.TXXX(encoding = 3, desc = 'FLAC_MD5',
+                           text = '%x' % src_tags.info.md5_signature))
+    for picture in src_tags.pictures:
+        dest_tags.add(id3.APIC(
+                encoding = 3,
+                mime = picture.mime,
+                type = picture.type,
+                desc = picture.desc,
+                data = picture.data
+        ))
+    dest_tags.save(dest)
+
+def to_src(relpath):
+    return os.path.join(archive, relpath)
+
+def to_dest(relpath, suffix = None):
+    if (suffix):
+        path = os.path.splitext(relpath)[0] + '.' + suffix
+    return os.path.join(target, path)
+
+def is_current(path1, path2):
+    return (not os.path.exists(path2)) or \
+        (os.path.exists(path1) and \
+             os.stat(path1).st_mtime >= os.stat(path2).st_mtime)
+
+def ensure_dir(fullpath):
+    destdir = os.path.dirname(fullpath)
+    if not os.path.exists(destdir):
+        os.makedirs(destdir)
+
+def text_frame(frame_class, desc = None):
+    def text_framer(id3_tag, flac_tag, key):
+        values = '\0'.join(flac_tag[key])
+        frame = frame_class(encoding = 3, text = values, desc = desc)
+        id3_tag.add(frame)
+    return text_framer
+
+def part_of_set(frame_class, total_key):
+    def part_of_set_setter(id3_tag, flac_tag, key):
+        if (flac_tag.has_key(total_key)):
+            value = "{0}/{1}".format(flac_tag[key][0], flac_tag[total_key][0])
+        else:
+            value = flac_tag[key][0]
+        frame = frame_class(encoding = 3, text = value)
+        id3_tag.add(frame)
+    return part_of_set_setter
+
+def ufid():
+    def ufidder(id3_tag, flac_tag, key):
+    	value = flac_tag[key][0]
+        frame = id3.UFID(owner = 'http://musicbrainz.org/', data = value)
+        id3_tag.add(frame)
+    return ufidder
+
+def add_person(frame_class, desc = ''):
+    def person_adder(id3_tag, flac_tag, key):
+        frameID = frame_class().FrameID
+        if (id3_tag.has_key(frame_class().FrameID)):
+            frame = id3_tag[frameID]
+        else:
+            frame = frame_class(encoding = 3)
+            id3_tag.add(frame)
+        for value in flac_tag[key]:
+            frame.people.append([desc, value])
+    return person_adder
+
+def add_performer(frame_class):
+    def performer_adder(id3_tag, flac_tag, key):
+        frameID = frame_class().FrameID
+        if (id3_tag.has_key(frame_class().FrameID)):
+            frame = id3_tag[frameID]
+        else:
+            frame = frame_class(encoding = 3)
+            id3_tag.add(frame)
+        for value in flac_tag[key]:
+            instrument = ''
+            person = value
+            if value.endswith(')'):
+                start = value.find(' (')
+                if start > 0:
+                    instrument = value[start + 2:-1]
+                    person = value[:start]
+            frame.people.append([instrument, person])
+    return performer_adder
+    
+# Follows http://wiki.musicbrainz.org/Picard_Tag_Mapping except:
+# - TSO2 instead of TXXX:albumartistsort (iTunes extension)
+# - No _rating => POPM
+# - license always maps to TXXX:license, no WCOP
+# - language not implemented for lyrics or comment
+# - encoder as well as encodedby
+# - mcn as well as barcode
+# - add replaygain tags.
+ID3_TAG_MAPPING = {
+    'album': text_frame(id3.TALB),
+    'title': text_frame(id3.TIT2),
+    'artist': text_frame(id3.TPE1),
+    'albumartist': text_frame(id3.TPE2),
+    'date': text_frame(id3.TDRC),
+    'originaldate': text_frame(id3.TDOR),
+    'composer': text_frame(id3.TCOM),
+    'lyricist': text_frame(id3.TEXT),
+    'conductor': text_frame(id3.TPE3),
+    'performer': add_performer(id3.TMCL),
+    'remixer': text_frame(id3.TPE4),
+    'arranger': add_person(id3.TIPL, 'arranger'),
+    'engineer': add_person(id3.TIPL, 'engineer'),
+    'producer': add_person(id3.TIPL, 'producer'),
+    'djmixer': add_person(id3.TIPL, 'DJ-mix'),
+    'mixer': add_person(id3.TIPL, 'mix'),
+    'grouping': text_frame(id3.TIT1),
+    'subtitle': text_frame(id3.TIT3),
+    'discsubtitle': text_frame(id3.TSST),
+    'tracknumber': part_of_set(id3.TRCK, 'totaltracks'),
+    'discnumber': part_of_set(id3.TPOS, 'totaldiscs'),
+    'compilation': text_frame(id3.TCMP),
+    'comment': text_frame(id3.COMM),
+    'genre': text_frame(id3.TCON),
+    'bpm': text_frame(id3.TBPM),
+    'mood': text_frame(id3.TMOO),
+    'isrc': text_frame(id3.TSRC),
+    'copyright': text_frame(id3.TCOP),
+    'lyrics': text_frame(id3.USLT),
+    'media': text_frame(id3.TMED),
+    'label': text_frame(id3.TPUB),
+    'catalognumber': text_frame(id3.TXXX, 'CATALOGNUMBER'),
+    'barcode': text_frame(id3.TXXX, 'barcode'),
+    'mcn': text_frame(id3.TXXX, 'barcode'),
+    'encodedby': text_frame(id3.TENC),
+    'encoder': text_frame(id3.TENC),
+    'albumsort': text_frame(id3.TSOA),
+    'albumartistsort': text_frame(id3.TSO2), # iTunes extension
+    'artistsort': text_frame(id3.TSOP),
+    'titlesort': text_frame(id3.TSOT),
+    'musicbrainz_trackid': ufid(),
+    'musicbrainz_albumid': text_frame(id3.TXXX, 'MusicBrainz Album Id'),
+    'musicbrainz_artistid': text_frame(id3.TXXX, 'MusicBrainz Artist Id'),
+    'musicbrainz_albumartistid': text_frame(id3.TXXX, 'MusicBrainz Album Artist Id'),
+    'musicbrainz_trmid': text_frame(id3.TXXX, 'MusicBrainz TRM Id'),
+    'musicbrainz_discid': text_frame(id3.TXXX, 'MusicBrainz Disc Id'),
+    'musicip_puid': text_frame(id3.TXXX, 'MusicIP PUID'),
+    'musicip_fingerprint': text_frame(id3.TXXX, 'MusicMagic Fingerprint'),
+    'releasestatus': text_frame(id3.TXXX, 'MusicBrainz Album Status'),
+    'releasetype': text_frame(id3.TXXX, 'MusicBrainz Album Type'),
+    'releasecountry': text_frame(id3.TXXX, 'MusicBrainz Album Release Country'),
+    'asin': text_frame(id3.TXXX, 'ASIN'),
+    'script': text_frame(id3.TXXX, 'SCRIPT'),
+    'language': text_frame(id3.TLAN),
+    'musicbrainz_releasegroupid': text_frame(id3.TXXX, 'MusicBrainz Release Group Id'),
+    'musicbrainz_workid': text_frame(id3.TXXX, 'MusicBrainz Work Id'),
+    'license': text_frame(id3.TXXX, 'LICENSE'),
+    # TODO RVA2 support, if any players support it
+    'replaygain_reference_loudness': text_frame(id3.TXXX, 'REPLAYGAIN_REFERENCE_LOUDNESS'),
+    'replaygain_track_gain': text_frame(id3.TXXX, 'REPLAYGAIN_TRACK_GAIN'),
+    'replaygain_track_peak': text_frame(id3.TXXX, 'REPLAYGAIN_TRACK_PEAK'),
+    'replaygain_album_gain': text_frame(id3.TXXX, 'REPLAYGAIN_ALBUM_GAIN'),
+    'replaygain_album_peak': text_frame(id3.TXXX, 'REPLAYGAIN_ALBUM_PEAK')
+}
+
+pool = Pool()
+walk_archive(archive, pool)
+pool.close()
+pool.join()
+
